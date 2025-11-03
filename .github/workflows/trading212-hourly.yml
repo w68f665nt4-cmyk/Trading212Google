@@ -1,6 +1,10 @@
 name: Trading212 Hourly Monitor
 
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9-22 * * *'
+
   schedule:
     - cron: '0 9-22 * * *'
 
