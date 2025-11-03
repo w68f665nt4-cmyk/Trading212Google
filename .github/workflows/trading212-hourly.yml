@@ -2,23 +2,28 @@ name: Trading212 Hourly Monitor
 
 on:
   schedule:
-    - cron: '0 9-22 * * *'  # Every hour from 9 AM to 10 PM UTC
+    - cron: '0 9-22 * * *'
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
-      
+        run: pip install -r requirements_clean.txt
+
+      - name: Create Google credentials file
+        env:
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDENTIALS_FILE }}
+        run: echo "$GOOGLE_CREDS" > google_creds.json
+
       - name: Run Trading212 monitor
         env:
           TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
