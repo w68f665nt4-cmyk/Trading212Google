@@ -1,15 +1,9 @@
 """
-Trading212 Portfolio Monitor - Clean Foundation v1.7.2 (Remove Total P&L column)
-Trading212 Portfolio Monitor - Clean Foundation v1.7.3 (Append vs Manual overwrite)
+Trading212 Portfolio Monitor - Clean Foundation v1.7.4 (Method + Name columns)
 ================================================================
-A clean, production-ready implementation focused on reliability and maintainability.
-
-Changelog v1.7.2:
-- Removed 'Total P&L (HUF)' column from Google Sheets upload (RawData sheet).
-- Updated header and row construction accordingly (Column C removed).
-- Hourly (scheduled) runs: always append new rows; never delete existing.
-- Manual runs: overwrite only previous MANUAL rows for the same day; if none yet today, append as new.
-- Implements a hidden marker column 'Mode' with values 'auto' or 'manual' to distinguish sources.
+- Adds Column K: Method (manual/automatic)
+- Adds Column L: Name (instrument display name)
+- Keeps simple daily upsert behavior
 """
 
 import os
@@ -17,7 +11,7 @@ import sys
 import json
 import argparse
 import logging
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -83,11 +77,7 @@ class Config:
         self.api_timeout = int(os.getenv("API_TIMEOUT", "15"))
         self.api_retries = int(os.getenv("API_RETRIES", "3"))
         self.data_dir = Path(os.getenv("DATA_DIR", "./data"))
-        self.log_level = os.getenv("LOG_LEVEL", "INFO")
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "cache").mkdir(parents=True, exist_ok=True)
-        (self.data_dir / "logs").mkdir(parents=True, exist_ok=True)
-        logger.info(f"Configuration loaded successfully (Timezone: {self.timezone})")
 
 
 @dataclass
@@ -103,20 +93,10 @@ class Position:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        d['total_value'] = self.total_value
-        d['pnl_percent'] = self.pnl_percent
-        return d
-
-    @property
-    def total_value(self) -> float:
-        return self.quantity * self.current_price
-
-    @property
-    def pnl_percent(self) -> float:
+        d['total_value'] = self.quantity * self.current_price
         invested = self.quantity * self.average_price
-        if invested == 0:
-            return 0.0
-        return (self.pnl / invested) * 100
+        d['pnl_percent'] = 0.0 if invested == 0 else (self.pnl / invested) * 100
+        return d
 
 
 @dataclass
@@ -134,27 +114,6 @@ class Portfolio:
             "positions": [p.to_dict() for p in self.positions],
             "position_count": len(self.positions),
         }
-
-    def __str__(self) -> str:
-        lines = [
-            "=" * 70,
-            f"PORTFOLIO SUMMARY - {self.timestamp}",
-            "=" * 70,
-        ]
-        for pos in self.positions:
-            lines.append(
-                f"{pos.ticker:12} | Qty: {pos.quantity:8.2f} | "
-                f"Avg: {pos.average_price:8.2f} {pos.currency} | "
-                f"Current: {pos.current_price:8.2f} {pos.currency}"
-            )
-            lines.append(
-                f"{'':12} | P&L: {pos.pnl:+8.2f} {pos.currency} | "
-                f"Total Val: {pos.total_value_huf:,.2f} HUF"
-            )
-            lines.append("-" * 70)
-        lines.append(f"TOTAL P&L: {self.total_pnl:+.2f} HUF")
-        lines.append("=" * 70)
-        return "\n".join(lines)
 
 
 class Trading212API:
@@ -180,295 +139,160 @@ class Trading212API:
         url = f"{self.base_url}{endpoint}"
         for attempt in range(1, self.retries + 1):
             try:
-                logger.debug(f"Request attempt {attempt}/{self.retries}: {method} {endpoint}")
-                if method.upper() == "GET":
-                    response = self.session.get(url, timeout=self.timeout, **kwargs)
-                else:
-                    response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+                response = self.session.request(method, url, timeout=self.timeout, **kwargs)
                 response.raise_for_status()
                 return response.json()
-            except Timeout:
-                logger.warning(f"Timeout on attempt {attempt}/{self.retries}")
+            except (Timeout, RequestException) as e:
                 if attempt == self.retries:
-                    logger.error(f"Final timeout: {method} {endpoint}")
+                    logger.error(f"API error {method} {endpoint}: {e}")
                     return None
-            except RequestException as e:
-                logger.error(f"Request error on attempt {attempt}/{self.retries}: {e}")
-                if attempt == self.retries:
-                    return None
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error: {e}")
-                return None
-            if attempt < self.retries:
-                import time
-                time.sleep(1)
         return None
 
     def get_portfolio(self) -> Optional[List[Dict]]:
         logger.info("Fetching portfolio from Trading212...")
-        data = self._request("GET", "/equity/portfolio")
-        if data:
-            logger.info(f"Successfully fetched {len(data)} positions")
-            return data
-        else:
-            logger.error("Failed to fetch portfolio")
-            return None
+        return self._request("GET", "/equity/portfolio")
 
     def get_instruments(self) -> Optional[Dict]:
         logger.info("Fetching instrument data...")
         data = self._request("GET", "/equity/metadata/instruments")
-        if data:
-            logger.info(f"Successfully fetched metadata for {len(data)} instruments")
-            return {item['ticker']: item for item in data}
-        else:
-            logger.error("Failed to fetch instruments")
-            return None
+        return {i['ticker']: i for i in data} if data else None
 
 
 class FXRateAPI:
-    def __init__(self, timeout: int = 10):
+    def __init__(self):
         self.base_url = "https://api.frankfurter.app"
-        self.timeout = timeout
-        self.cache: Dict[Tuple[str, str], float] = {}
+        self.cache: Dict[str, float] = {}
 
-    def get_rate(self, from_currency: str, to_currency: str) -> float:
-        if from_currency == to_currency:
+    def get_rate(self, from_ccy: str, to_ccy: str) -> float:
+        if from_ccy == to_ccy:
             return 1.0
-        cache_key = (from_currency, to_currency)
-        if cache_key in self.cache:
-            logger.debug(f"Using cached rate: {from_currency}/{to_currency}")
-            return self.cache[cache_key]
-        logger.info(f"Fetching FX rate: {from_currency}/{to_currency}")
+        key = f"{from_ccy}/{to_ccy}"
+        if key in self.cache:
+            return self.cache[key]
         try:
-            response = requests.get(
-                f"{self.base_url}/latest",
-                params={"from": from_currency, "to": to_currency},
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-            data = response.json()
-            if "rates" in data and to_currency in data["rates"]:
-                rate = float(data["rates"][to_currency])
-                self.cache[cache_key] = rate
-                logger.debug(f"FX Rate: {from_currency}/{to_currency} = {rate:.4f}")
-                return rate
-            else:
-                logger.error(f"FX API returned unexpected data: {data}")
-                return 1.0
-        except RequestException as e:
-            logger.error(f"Failed to fetch FX rate: {e}")
-            return 1.0
-        except (ValueError, KeyError) as e:
-            logger.error(f"Failed to parse FX rate response: {e}")
+            r = requests.get(f"{self.base_url}/latest", params={"from": from_ccy, "to": to_ccy}, timeout=10)
+            r.raise_for_status()
+            return float(r.json()["rates"][to_ccy])
+        except Exception:
             return 1.0
 
 
 class PortfolioProcessor:
     def __init__(self, timezone: pytz.timezone):
-        self.timezone = timezone
-        self.fx_api = FXRateAPI()
+        self.tz = timezone
+        self.fx = FXRateAPI()
 
-    def process(self, raw_positions: List[Dict], instrument_metadata: Optional[Dict] = None) -> Optional[Portfolio]:
-        if not raw_positions:
-            logger.warning("No positions to process")
+    def process(self, raw: List[Dict], meta: Optional[Dict]) -> Optional[Portfolio]:
+        if not raw:
             return None
-        logger.info(f"Processing {len(raw_positions)} positions...")
-        try:
-            usd_huf = self.fx_api.get_rate("USD", "HUF")
-            eur_huf = self.fx_api.get_rate("EUR", "HUF")
-            positions: List[Position] = []
-            total_pnl_huf = 0.0
-            for raw_pos in raw_positions:
-                try:
-                    ticker = raw_pos.get("ticker", "UNKNOWN")
-                    quantity = float(raw_pos.get("quantity", 0))
-                    avg_price = float(raw_pos.get("averagePrice", 0))
-                    current_price = float(raw_pos.get("currentPrice", 0))
-                    pnl = float(raw_pos.get("ppl", 0))
-                    if instrument_metadata and ticker in instrument_metadata:
-                        currency = instrument_metadata[ticker].get("currencyCode", "EUR")
-                        display_name = instrument_metadata[ticker].get("name", ticker)
-                    else:
-                        currency = "USD" if "_US_" in ticker else "EUR"
-                        display_name = ticker
-                    pos = Position(
-                        ticker=ticker,
-                        display_name=display_name,
-                        quantity=quantity,
-                        average_price=avg_price,
-                        current_price=current_price,
-                        pnl=pnl,
-                        currency=currency,
-                    )
-                    fx_rate = 1.0
-                    if currency == "USD":
-                        fx_rate = usd_huf
-                    elif currency == "EUR":
-                        fx_rate = eur_huf
-                    total_pnl_huf += pnl * fx_rate
-                    pos.total_value_huf = pos.total_value * fx_rate
-                    positions.append(pos)
-                except (ValueError, KeyError) as e:
-                    logger.warning(f"Skipping position {raw_pos.get('ticker', 'UNKNOWN')}: {e}")
-                    continue
-            if not positions:
-                logger.error("No valid positions after processing")
-                return None
-            now = datetime.now(self.timezone)
-            portfolio = Portfolio(
-                positions=positions,
-                timestamp=now.isoformat(),
-                timezone=str(self.timezone),
-                total_pnl=total_pnl_huf,
-            )
-            logger.info(f"Successfully processed {len(positions)} positions")
-            return portfolio
-        except Exception as e:
-            logger.error(f"Error processing portfolio: {e}", exc_info=True)
+        usd_huf = self.fx.get_rate("USD", "HUF")
+        eur_huf = self.fx.get_rate("EUR", "HUF")
+        positions: List[Position] = []
+        total_pnl_huf = 0.0
+        for r in raw:
+            try:
+                t = r.get("ticker", "UNKNOWN")
+                qty = float(r.get("quantity", 0))
+                avg = float(r.get("averagePrice", 0))
+                cur = float(r.get("currentPrice", 0))
+                ppl = float(r.get("ppl", 0))
+                if meta and t in meta:
+                    ccy = meta[t].get("currencyCode", "EUR")
+                    name = meta[t].get("name", t)
+                else:
+                    ccy = "USD" if "_US_" in t else "EUR"
+                    name = t
+                pos = Position(ticker=t, display_name=name, quantity=qty,
+                               average_price=avg, current_price=cur, pnl=ppl, currency=ccy)
+                rate = usd_huf if ccy == "USD" else eur_huf if ccy == "EUR" else 1.0
+                total_pnl_huf += ppl * rate
+                pos.total_value_huf = pos.quantity * pos.current_price * rate
+                positions.append(pos)
+            except Exception:
+                continue
+        if not positions:
             return None
+        now = datetime.now(self.tz)
+        return Portfolio(positions=positions, timestamp=now.isoformat(), timezone=str(self.tz), total_pnl=total_pnl_huf)
 
 
 class GoogleSheets:
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.file"
+        "https://www.googleapis.com/auth/drive.file",
     ]
 
     def __init__(self, sheet_id: str, creds_file: str):
         self.sheet_id = sheet_id
         self.creds_file = creds_file
-        self.client = self._authenticate()
-        self.sheet = self._open_sheet()
+        self.client = self._auth()
+        self.sheet = self._open()
 
-    def _authenticate(self) -> Optional[gspread.Client]:
+    def _auth(self) -> Optional[gspread.Client]:
         try:
-            if not Path(self.creds_file).exists():
-                logger.error(f"Google credentials file not found: {self.creds_file}")
-                return None
-            creds = ServiceAccountCredentials.from_json_keyfile_name(
-                self.creds_file, self.SCOPES
-            )
-            client = gspread.authorize(creds)
-            logger.info("Google Sheets authentication successful")
-            return client
+            creds = ServiceAccountCredentials.from_json_keyfile_name(self.creds_file, self.SCOPES)
+            return gspread.authorize(creds)
         except Exception as e:
-            logger.error(f"Google Sheets authentication failed: {e}", exc_info=True)
+            logger.error(f"GSheet auth failed: {e}")
             return None
 
-    def _open_sheet(self) -> Optional[gspread.Spreadsheet]:
+    def _open(self) -> Optional[gspread.Spreadsheet]:
         if not self.client:
             return None
         try:
-            sheet = self.client.open_by_key(self.sheet_id)
-            logger.info(f"Successfully opened Google Sheet: {sheet.title}")
-            return sheet
-        except gspread.exceptions.APIError as e:
-            logger.error(f"Failed to open Google Sheet (ID: {self.sheet_id}). Check ID and sharing permissions. Error: {e}")
-            return None
+            return self.client.open_by_key(self.sheet_id)
         except Exception as e:
-            logger.error(f"Error opening Google Sheet: {e}", exc_info=True)
+            logger.error(f"Open sheet failed: {e}")
             return None
 
-    def _get_worksheet(self, title: str) -> Optional[gspread.Worksheet]:
+    def _ws(self, title: str) -> Optional[gspread.Worksheet]:
         if not self.sheet:
             return None
         try:
             return self.sheet.worksheet(title)
         except gspread.exceptions.WorksheetNotFound:
-            logger.info(f"Worksheet '{title}' not found, creating it...")
             return self.sheet.add_worksheet(title=title, rows=100, cols=20)
         except Exception as e:
-            logger.error(f"Error accessing worksheet '{title}': {e}", exc_info=True)
+            logger.error(f"Worksheet access failed: {e}")
             return None
 
-    def upsert_daily_data(self, portfolio: Portfolio, sheet_name: str, mode: str) -> bool:
-        """Append or upsert based on mode.
-        mode: 'auto' for scheduled, 'manual' for workflow_dispatch/local.
-        - auto: append rows only
-        - manual: delete today's rows where Mode == 'manual', then append
-        """
-        worksheet = self._get_worksheet(sheet_name)
-        if not worksheet:
-            logger.error(f"Could not get or create worksheet '{sheet_name}'")
+    def upsert_daily(self, portfolio: Portfolio, title: str, method: str) -> bool:
+        ws = self._ws(title)
+        if not ws:
             return False
-        logger.info(f"Upserting data to Google Sheet '{sheet_name}' (mode={mode})...")
+        header = [
+            "Date", "Timestamp", "Ticker",
+            "Quantity", "Avg Price", "Current Price", "P&L",
+            "Currency", "Total value in foreign currency", "Total value in HUF",
+            "Method", "Name"
+        ]
         try:
-            # Header WITHOUT Total P&L column
-            header = [
-                "Date", "Timestamp", "Ticker",
-                "Quantity", "Avg Price", "Current Price", "P&L",
-                "Currency", "Total value in foreign currency", "Total value in HUF",
-                "Mode"
-            ]
-            try:
-                is_new_sheet = worksheet.acell('A1').value is None
-            except gspread.exceptions.APIError:
-                is_new_sheet = True
-            if is_new_sheet:
-                worksheet.append_row(header, value_input_option='USER_ENTERED')
-                logger.info(f"Worksheet '{sheet_name}' is new. Added header.")
+            if ws.acell('A1').value is None:
+                ws.append_row(header, value_input_option='USER_ENTERED')
+        except Exception:
+            ws.append_row(header, value_input_option='USER_ENTERED')
 
-            current_date = portfolio.timestamp[:10]
-            logger.info(f"Checking for existing data for date: {current_date}")
+        today = portfolio.timestamp[:10]
+        try:
+            cells = ws.findall(today, in_column=1)
+        except gspread.exceptions.CellNotFound:
+            cells = []
+        if cells:
+            start = cells[0].row
+            end = cells[-1].row
+            ws.delete_rows(start, end)
 
-            if mode == 'manual':
-                # Find rows for today where Mode == 'manual' (column 11)
-                try:
-                    all_today = worksheet.findall(current_date, in_column=1)
-                except gspread.exceptions.CellNotFound:
-                    all_today = []
-                if all_today:
-                    # Filter rows where column 11 equals 'manual'
-                    rows_to_delete = []
-                    for cell in all_today:
-                        try:
-                            mode_value = worksheet.cell(cell.row, 11).value
-                            if (mode_value or '').lower() == 'manual':
-                                rows_to_delete.append(cell.row)
-                        except Exception:
-                            continue
-                    if rows_to_delete:
-                        # Delete contiguous blocks efficiently
-                        rows_to_delete.sort()
-                        start = rows_to_delete[0]
-                        end = rows_to_delete[0]
-                        for r in rows_to_delete[1:]:
-                            if r == end + 1:
-                                end = r
-                            else:
-                                worksheet.delete_rows(start, end)
-                                start = r
-                                end = r
-                        worksheet.delete_rows(start, end)
-                        logger.info(f"Deleted previous manual rows for {current_date}.")
-
-            # Build rows
-            rows_to_append = []
-            timestamp_str = portfolio.timestamp
-            for pos in portfolio.positions:
-                rows_to_append.append([
-                    current_date,
-                    timestamp_str,
-                    pos.ticker,
-                    pos.quantity,
-                    pos.average_price,
-                    pos.current_price,
-                    pos.pnl,
-                    pos.currency,
-                    pos.total_value,
-                    pos.total_value_huf,
-                    mode
-                ])
-            logger.info(f"Appending {len(rows_to_append)} new rows...")
-            worksheet.append_rows(rows_to_append, value_input_option='USER_ENTERED')
-            logger.info(f"Successfully upserted data to '{sheet_name}' (mode={mode})")
-            return True
-        except gspread.exceptions.APIError as e:
-            logger.error(f"Google Sheets API error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to upsert to Google Sheet: {e}", exc_info=True)
-            return False
+        rows: List[List[Any]] = []
+        ts = portfolio.timestamp
+        for p in portfolio.positions:
+            rows.append([
+                today, ts, p.ticker,
+                p.quantity, p.average_price, p.current_price, p.pnl,
+                p.currency, p.quantity * p.current_price, p.total_value_huf,
+                method, p.display_name
+            ])
+        ws.append_rows(rows, value_input_option='USER_ENTERED')
+        return True
 
 
 class Application:
@@ -477,149 +301,67 @@ class Application:
         self.trading212 = Trading212API(
             self.config.api_key,
             self.config.api_secret,
-            self.config.api_timeout,
-            self.config.api_retries
+            timeout=self.config.api_timeout,
+            retries=self.config.api_retries,
         )
         self.processor = PortfolioProcessor(self.config.timezone)
-        self.store = DataStore(self.config.data_dir)
         self.google_sheet = GoogleSheets(
             self.config.google_sheet_id,
             self.config.google_creds_file
         )
 
     def fetch(self) -> Optional[Portfolio]:
-        logger.info("Starting portfolio fetch...")
-        raw_positions = self.trading212.get_portfolio()
-        if not raw_positions:
+        raw = self.trading212.get_portfolio()
+        if not raw:
             return None
-        instrument_metadata = self.trading212.get_instruments()
-        portfolio = self.processor.process(raw_positions, instrument_metadata)
-        return portfolio
-
-    def fetch_and_display(self) -> bool:
-        portfolio = self.fetch()
-        if portfolio:
-            print("\n" + str(portfolio))
-            return True
-        else:
-            logger.error("Could not fetch portfolio")
-            return False
-
-    def fetch_and_save(self) -> bool:
-        portfolio = self.fetch()
-        if portfolio:
-            return self.store.save_portfolio(portfolio)
-        else:
-            logger.error("Could not fetch portfolio")
-            return False
-
-    def show_latest(self) -> bool:
-        data = self.store.load_latest_portfolio()
-        if data:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-            return True
-        else:
-            logger.warning("No saved portfolio available")
-            return False
+        meta = self.trading212.get_instruments()
+        return self.processor.process(raw, meta)
 
     def fetch_and_upload_to_gsheet(self) -> bool:
-        sheet_name = "RawData"
-        logger.info(f"Target worksheet name set to: {sheet_name}")
         portfolio = self.fetch()
         if not portfolio:
-            logger.error("Could not fetch portfolio, skipping GSheet upload")
             return False
-        if not self.google_sheet.client or not self.google_sheet.sheet:
-            logger.error("Google Sheets client not initialized. Cannot upload.")
-            return False
-        # Determine mode from GitHub Actions; default to 'manual' when run locally
-        gh_event = os.getenv('GITHUB_EVENT_NAME', '')
-        mode = 'auto' if gh_event == 'schedule' else 'manual'
-        return self.google_sheet.upsert_daily_data(portfolio, sheet_name, mode)
-
-
-class DataStore:
-    def __init__(self, data_dir: Path):
-        self.data_dir = data_dir
-        self.portfolio_dir = data_dir / "portfolios"
-        self.portfolio_dir.mkdir(parents=True, exist_ok=True)
-
-    def save_portfolio(self, portfolio: Portfolio) -> bool:
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = self.portfolio_dir / f"portfolio_{timestamp}.json"
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(portfolio.to_dict(), f, indent=2, ensure_ascii=False)
-            logger.info(f"Portfolio saved to {filename}")
-            return True
-        except IOError as e:
-            logger.error(f"Failed to save portfolio: {e}")
-            return False
-
-    def load_latest_portfolio(self) -> Optional[Portfolio]:
-        try:
-            files = sorted(self.portfolio_dir.glob("portfolio_*.json"), reverse=True)
-            if not files:
-                logger.warning("No saved portfolios found")
-                return None
-            latest_file = files[0]
-            with open(latest_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            logger.info(f"Loaded portfolio from {latest_file}")
-            return data
-        except (IOError, json.JSONDecodeError) as e:
-            logger.error(f"Failed to load portfolio: {e}")
-            return None
+        event = os.getenv('GITHUB_EVENT_NAME', '')
+        method = 'manual' if event == 'workflow_dispatch' else 'automatic'
+        return self.google_sheet.upsert_daily(portfolio, "RawData", method)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Trading212 Portfolio Monitor",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python trading212_clean.py fetch        Fetch and display portfolio
-  python trading212_clean.py save         Fetch and save to JSON
-  python trading212_clean.py gsheet       Fetch and upload to Google Sheets
-  python trading212_clean.py latest       Show latest saved portfolio
-  python trading212_clean.py --verbose    Increase logging verbosity
-        """
+        description="Trading212 Portfolio Monitor v1.7.4",
     )
-    parser.add_argument(
-        "command",
-        nargs="?",
-        default="fetch",
-        choices=["fetch", "save", "latest", "gsheet"],
-        help="Command to execute (default: fetch)"
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging"
-    )
+    parser.add_argument("command", nargs="?", default="fetch", choices=["fetch", "save", "latest", "gsheet"])  
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     if args.verbose:
+        for h in logger.handlers:
+            h.setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
-        for handler in logger.handlers:
-            if isinstance(handler, logging.StreamHandler):
-                handler.setLevel(logging.DEBUG)
-    logger.info(f"Trading212 Portfolio Monitor v1.7.2 - Command: {args.command}")
-    try:
-        app = Application()
-        if args.command == "fetch":
-            success = app.fetch_and_display()
-        elif args.command == "save":
-            success = app.fetch_and_save()
-        elif args.command == "latest":
-            success = app.show_latest()
-        elif args.command == "gsheet":
-            success = app.fetch_and_upload_to_gsheet()
-        sys.exit(0 if success else 1)
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+
+    app = Application()
+
+    if args.command == "gsheet":
+        ok = app.fetch_and_upload_to_gsheet()
+        sys.exit(0 if ok else 1)
+    elif args.command == "fetch":
+        pf = app.fetch()
+        if pf:
+            print(str(pf))
+            sys.exit(0)
+        sys.exit(1)
+    elif args.command == "save":
+        pf = app.fetch()
+        if pf:
+            Path("data").mkdir(exist_ok=True)
+            with open("data/portfolio.json", "w", encoding="utf-8") as f:
+                json.dump(pf.to_dict(), f, indent=2, ensure_ascii=False)
+            sys.exit(0)
+        sys.exit(1)
+    elif args.command == "latest":
+        p = Path("data/portfolio.json")
+        if p.exists():
+            print(p.read_text())
+            sys.exit(0)
         sys.exit(1)
 
 
