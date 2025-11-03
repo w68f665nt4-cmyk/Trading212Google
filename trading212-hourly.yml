@@ -1,0 +1,34 @@
+name: Trading212 Hourly Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9-22 * * *'
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements_clean.txt
+
+      - name: Create Google credentials file
+        env:
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDENTIALS_FILE }}
+        run: echo "$GOOGLE_CREDS" > google_creds.json
+
+      - name: Run Trading212 monitor
+        env:
+          TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
+          TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS_FILE: ./google_creds.json
+        run: python trading212_clean.py gsheet
