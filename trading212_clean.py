@@ -3,7 +3,6 @@ Trading212 Portfolio Monitor - Clean Foundation v1.7.2 (Repaired)
 ================================================================
 Working revert with correct syntax and minimal features.
 """
-
 import os
 import sys
 import json
@@ -15,19 +14,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
-
 import requests
 from requests.exceptions import RequestException, Timeout
 from dotenv import load_dotenv
-
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-
-
 # ----------------------------------------------------------------------------
 # LOGGING
 # ----------------------------------------------------------------------------
-
 def setup_logging(level: str = "INFO") -> logging.Logger:
     logger = logging.getLogger("Trading212Monitor")
     logger.setLevel(getattr(logging, level))
@@ -40,15 +34,10 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
         ))
         logger.addHandler(ch)
     return logger
-
-
 logger = setup_logging()
-
-
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
-
 class Config:
     REQUIRED_VARS = [
         "TRADING212_API_KEY",
@@ -56,7 +45,6 @@ class Config:
         "GOOGLE_SHEET_ID",
         "GOOGLE_CREDENTIALS_FILE",
     ]
-
     def __init__(self, env_file: str = ".env"):
         if Path(env_file).exists():
             load_dotenv(env_file)
@@ -71,12 +59,9 @@ class Config:
         self.timezone = pytz.timezone(os.getenv("TIMEZONE", "Europe/Budapest"))
         self.api_timeout = int(os.getenv("API_TIMEOUT", "15"))
         self.api_retries = int(os.getenv("API_RETRIES", "3"))
-
-
 # ----------------------------------------------------------------------------
 # DATA MODELS
 # ----------------------------------------------------------------------------
-
 @dataclass
 class Position:
     ticker: str
@@ -87,22 +72,18 @@ class Position:
     pnl: float
     currency: str
     total_value_huf: float = 0.0
-
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["total_value"] = self.quantity * self.current_price
         invested = self.quantity * self.average_price
         d["pnl_percent"] = 0.0 if invested == 0 else (self.pnl / invested) * 100
         return d
-
-
 @dataclass
 class Portfolio:
     positions: List[Position]
     timestamp: str
     timezone: str
     total_pnl: float = 0.0
-
     def to_dict(self) -> Dict[str, Any]:
         return {
             "timestamp": self.timestamp,
@@ -111,7 +92,6 @@ class Portfolio:
             "positions": [p.to_dict() for p in self.positions],
             "position_count": len(self.positions),
         }
-
     def __str__(self) -> str:
         lines = [
             "=" * 70,
@@ -132,12 +112,9 @@ class Portfolio:
         lines.append(f"TOTAL P&L: {self.total_pnl:+.2f} HUF")
         lines.append("=" * 70)
         return "\n".join(lines)
-
-
 # ----------------------------------------------------------------------------
 # TRADING212 API
 # ----------------------------------------------------------------------------
-
 class Trading212API:
     def __init__(self, api_key: str, api_secret: str, timeout: int = 15, retries: int = 3):
         self.base_url = "https://live.trading212.com/api/v0"
@@ -149,7 +126,6 @@ class Trading212API:
             "Authorization": f"Basic {cred}",
             "Accept": "application/json"
         })
-
     def _request(self, method: str, endpoint: str, **kwargs) -> Optional[Dict]:
         url = f"{self.base_url}{endpoint}"
         for attempt in range(1, self.retries + 1):
@@ -161,24 +137,18 @@ class Trading212API:
                 if attempt == self.retries:
                     logger.error(f"API error {method} {endpoint}: {e}")
                     return None
-
     def get_portfolio(self) -> Optional[List[Dict]]:
         return self._request("GET", "/equity/portfolio")
-
     def get_instruments(self) -> Optional[Dict]:
         data = self._request("GET", "/equity/metadata/instruments")
         return {i['ticker']: i for i in data} if data else None
-
-
 # ----------------------------------------------------------------------------
 # FX RATES
 # ----------------------------------------------------------------------------
-
 class FXRateAPI:
     def __init__(self):
         self.base_url = "https://api.frankfurter.app"
         self.cache: Dict[str, float] = {}
-
     def get_rate(self, from_ccy: str, to_ccy: str) -> float:
         if from_ccy == to_ccy:
             return 1.0
@@ -197,17 +167,13 @@ class FXRateAPI:
             return rate
         except Exception:
             return 1.0
-
-
 # ----------------------------------------------------------------------------
 # PROCESSOR
 # ----------------------------------------------------------------------------
-
 class PortfolioProcessor:
     def __init__(self, timezone: pytz.timezone):
         self.tz = timezone
         self.fx = FXRateAPI()
-
     def process(self, raw: List[Dict], meta: Optional[Dict]) -> Optional[Portfolio]:
         if not raw:
             return None
@@ -242,24 +208,19 @@ class PortfolioProcessor:
             return None
         now = datetime.now(self.tz)
         return Portfolio(positions=positions, timestamp=now.isoformat(), timezone=str(self.tz), total_pnl=total_pnl_huf)
-
-
 # ----------------------------------------------------------------------------
 # GOOGLE SHEETS
 # ----------------------------------------------------------------------------
-
 class GoogleSheets:
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.file",
     ]
-
     def __init__(self, sheet_id: str, creds_file: str):
         self.sheet_id = sheet_id
         self.creds_file = creds_file
         self.client = self._auth()
         self.sheet = self._open()
-
     def _auth(self) -> Optional[gspread.Client]:
         try:
             creds = ServiceAccountCredentials.from_json_keyfile_name(self.creds_file, self.SCOPES)
@@ -267,7 +228,6 @@ class GoogleSheets:
         except Exception as e:
             logger.error(f"GSheet auth failed: {e}")
             return None
-
     def _open(self) -> Optional[gspread.Spreadsheet]:
         if not self.client:
             return None
@@ -276,7 +236,6 @@ class GoogleSheets:
         except Exception as e:
             logger.error(f"Open sheet failed: {e}")
             return None
-
     def _ws(self, title: str) -> Optional[gspread.Worksheet]:
         if not self.sheet:
             return None
@@ -287,7 +246,6 @@ class GoogleSheets:
         except Exception as e:
             logger.error(f"Worksheet access failed: {e}")
             return None
-
     def upsert_daily(self, portfolio: Portfolio, title: str) -> bool:
         ws = self._ws(title)
         if not ws:
@@ -302,7 +260,6 @@ class GoogleSheets:
                 ws.append_row(header, value_input_option='USER_ENTERED')
         except Exception:
             ws.append_row(header, value_input_option='USER_ENTERED')
-
         today = portfolio.timestamp[:10]
         try:
             cells = ws.findall(today, in_column=1)
@@ -312,7 +269,6 @@ class GoogleSheets:
             start = cells[0].row
             end = cells[-1].row
             ws.delete_rows(start, end)
-
         rows: List[List[Any]] = []
         ts = portfolio.timestamp
         for p in portfolio.positions:
@@ -323,12 +279,9 @@ class GoogleSheets:
             ])
         ws.append_rows(rows, value_input_option='USER_ENTERED')
         return True
-
-
 # ----------------------------------------------------------------------------
 # APP
 # ----------------------------------------------------------------------------
-
 class Application:
     def __init__(self):
         self.cfg = Config()
@@ -336,35 +289,28 @@ class Application:
                                   timeout=self.cfg.api_timeout, retries=self.cfg.api_retries)
         self.proc = PortfolioProcessor(self.cfg.timezone)
         self.gs = GoogleSheets(self.cfg.google_sheet_id, self.cfg.google_creds_file)
-
     def fetch(self) -> Optional[Portfolio]:
         raw = self.t212.get_portfolio()
         if not raw:
             return None
         meta = self.t212.get_instruments()
         return self.proc.process(raw, meta)
-
     def fetch_and_upload_to_gsheet(self) -> bool:
         pf = self.fetch()
         if not pf:
             return False
         return self.gs.upsert_daily(pf, "RawData")
-
-
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", nargs="?", default="fetch", choices=["fetch", "save", "latest", "gsheet"])  
+    parser.add_argument("command", nargs="?", default="fetch", choices=["fetch", "save", "latest", "gsheet"])
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     if args.verbose:
         setup_logging("DEBUG")
-
     app = Application()
-
     if args.command == "gsheet":
         ok = app.fetch_and_upload_to_gsheet()
         sys.exit(0 if ok else 1)
@@ -388,7 +334,5 @@ def main():
             print(p.read_text())
             sys.exit(0)
         sys.exit(1)
-
-
 if __name__ == "__main__":
     main()
