@@ -31,5 +31,4 @@ jobs:
           TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS_FILE: ./google_creds.json
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-        run: python run.py gsheet --verbose
+        run: python trading212_clean.py gsheet
