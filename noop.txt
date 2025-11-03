@@ -1,3 +1,0 @@
-# Patch: add explicit logging at start of gsheet run and guard prints
-# This small wrapper imports the module and runs main() with verbose logging
-# Not used; instead we modify trading212_clean.py to ensure output.
