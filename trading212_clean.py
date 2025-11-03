@@ -12,15 +12,23 @@ Changelog v1.7.2:
 - Implements a hidden marker column 'Mode' with values 'auto' or 'manual' to distinguish sources.
 """
 
-# ... keep existing imports ...
 import os
 import sys
 import json
-@@ -27,370 +26,39 @@
+import argparse
+import logging
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+import base64
+import pytz
+from dotenv import load_dotenv
+import requests
+from requests.exceptions import RequestException, Timeout
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# existing code omitted for brevity up to GoogleSheets class
 
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
     logger = logging.getLogger("Trading212Monitor")
@@ -319,20 +327,18 @@ class PortfolioProcessor:
             logger.error(f"Error processing portfolio: {e}", exc_info=True)
             return None
 
-# ===== Replace GoogleSheets.upsert_daily_data and Application.fetch_and_upload_to_gsheet =====
 
 class GoogleSheets:
-SCOPES = [
-"https://www.googleapis.com/auth/spreadsheets",
-"https://www.googleapis.com/auth/drive.file"
-]
+    SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file"
+    ]
 
-def __init__(self, sheet_id: str, creds_file: str):
-self.sheet_id = sheet_id
-self.creds_file = creds_file
-self.client = self._authenticate()
-self.sheet = self._open_sheet()
-    # ... _authenticate, _open_sheet, _get_worksheet unchanged ...
+    def __init__(self, sheet_id: str, creds_file: str):
+        self.sheet_id = sheet_id
+        self.creds_file = creds_file
+        self.client = self._authenticate()
+        self.sheet = self._open_sheet()
 
     def _authenticate(self) -> Optional[gspread.Client]:
         try:
@@ -375,48 +381,35 @@ self.sheet = self._open_sheet()
             logger.error(f"Error accessing worksheet '{title}': {e}", exc_info=True)
             return None
 
-    def upsert_daily_data(self, portfolio: Portfolio, sheet_name: str) -> bool:
-    def upsert_daily_data(self, portfolio: 'Portfolio', sheet_name: str, mode: str) -> bool:
+    def upsert_daily_data(self, portfolio: Portfolio, sheet_name: str, mode: str) -> bool:
         """Append or upsert based on mode.
         mode: 'auto' for scheduled, 'manual' for workflow_dispatch/local.
         - auto: append rows only
         - manual: delete today's rows where Mode == 'manual', then append
         """
-worksheet = self._get_worksheet(sheet_name)
-if not worksheet:
-logger.error(f"Could not get or create worksheet '{sheet_name}'")
-return False
-        logger.info(f"Upserting data to Google Sheet '{sheet_name}'...")
+        worksheet = self._get_worksheet(sheet_name)
+        if not worksheet:
+            logger.error(f"Could not get or create worksheet '{sheet_name}'")
+            return False
         logger.info(f"Upserting data to Google Sheet '{sheet_name}' (mode={mode})...")
-try:
+        try:
             # Header WITHOUT Total P&L column
-header = [
-"Date", "Timestamp", "Ticker",
-"Quantity", "Avg Price", "Current Price", "P&L",
-                "Currency", "Total value in foreign currency", "Total value in HUF"
+            header = [
+                "Date", "Timestamp", "Ticker",
+                "Quantity", "Avg Price", "Current Price", "P&L",
                 "Currency", "Total value in foreign currency", "Total value in HUF",
                 "Mode"
-]
-try:
-is_new_sheet = worksheet.acell('A1').value is None
-@@ -400,19 +68,41 @@ def upsert_daily_data(self, portfolio: Portfolio, sheet_name: str) -> bool:
-if is_new_sheet:
-worksheet.append_row(header, value_input_option='USER_ENTERED')
-logger.info(f"Worksheet '{sheet_name}' is new. Added header.")
-
-current_date = portfolio.timestamp[:10]
-            logger.info(f"Checking for existing data for date: {current_date}")
-            cells_to_delete = []
+            ]
             try:
-                cells_to_delete = worksheet.findall(current_date, in_column=1)
-            except gspread.exceptions.CellNotFound:
-                logger.info("No existing data found for today.")
-            if cells_to_delete:
-                logger.info(f"Found {len(cells_to_delete)} existing rows for {current_date}. Deleting...")
-                start_row = cells_to_delete[0].row
-                end_row = cells_to_delete[-1].row
-                worksheet.delete_rows(start_row, end_row)
-                logger.info(f"Deleted rows {start_row} to {end_row}.")
+                is_new_sheet = worksheet.acell('A1').value is None
+            except gspread.exceptions.APIError:
+                is_new_sheet = True
+            if is_new_sheet:
+                worksheet.append_row(header, value_input_option='USER_ENTERED')
+                logger.info(f"Worksheet '{sheet_name}' is new. Added header.")
+
+            current_date = portfolio.timestamp[:10]
+            logger.info(f"Checking for existing data for date: {current_date}")
 
             if mode == 'manual':
                 # Find rows for today where Mode == 'manual' (column 11)
@@ -450,44 +443,58 @@ current_date = portfolio.timestamp[:10]
                         logger.info(f"Deleted previous manual rows for {current_date}.")
 
             # Build rows
-rows_to_append = []
-timestamp_str = portfolio.timestamp
-for pos in portfolio.positions:
-@@ -426,11 +116,12 @@ def upsert_daily_data(self, portfolio: Portfolio, sheet_name: str) -> bool:
-pos.pnl,
-pos.currency,
-pos.total_value,
-                    pos.total_value_huf
+            rows_to_append = []
+            timestamp_str = portfolio.timestamp
+            for pos in portfolio.positions:
+                rows_to_append.append([
+                    current_date,
+                    timestamp_str,
+                    pos.ticker,
+                    pos.quantity,
+                    pos.average_price,
+                    pos.current_price,
+                    pos.pnl,
+                    pos.currency,
+                    pos.total_value,
                     pos.total_value_huf,
                     mode
-])
-logger.info(f"Appending {len(rows_to_append)} new rows...")
-worksheet.append_rows(rows_to_append, value_input_option='USER_ENTERED')
-            logger.info(f"Successfully upserted data to '{sheet_name}'")
+                ])
+            logger.info(f"Appending {len(rows_to_append)} new rows...")
+            worksheet.append_rows(rows_to_append, value_input_option='USER_ENTERED')
             logger.info(f"Successfully upserted data to '{sheet_name}' (mode={mode})")
-return True
-except gspread.exceptions.APIError as e:
-logger.error(f"Google Sheets API error: {e}")
-@@ -439,7 +130,6 @@ def upsert_daily_data(self, portfolio: Portfolio, sheet_name: str) -> bool:
-logger.error(f"Failed to upsert to Google Sheet: {e}", exc_info=True)
-return False
+            return True
+        except gspread.exceptions.APIError as e:
+            logger.error(f"Google Sheets API error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to upsert to Google Sheet: {e}", exc_info=True)
+            return False
 
 
 class Application:
-def __init__(self):
-self.config = Config()
-@@ -456,7 +146,7 @@ def __init__(self):
-self.config.google_creds_file
-)
+    def __init__(self):
+        self.config = Config()
+        self.trading212 = Trading212API(
+            self.config.api_key,
+            self.config.api_secret,
+            self.config.api_timeout,
+            self.config.api_retries
+        )
+        self.processor = PortfolioProcessor(self.config.timezone)
+        self.store = DataStore(self.config.data_dir)
+        self.google_sheet = GoogleSheets(
+            self.config.google_sheet_id,
+            self.config.google_creds_file
+        )
 
     def fetch(self) -> Optional[Portfolio]:
-    def fetch(self) -> Optional['Portfolio']:
-logger.info("Starting portfolio fetch...")
-raw_positions = self.trading212.get_portfolio()
-if not raw_positions:
-@@ -466,130 +156,19 @@ def fetch(self) -> Optional[Portfolio]:
-portfolio = self.processor.process(raw_positions, instrument_metadata)
-return portfolio
+        logger.info("Starting portfolio fetch...")
+        raw_positions = self.trading212.get_portfolio()
+        if not raw_positions:
+            return None
+        instrument_metadata = self.trading212.get_instruments()
+        portfolio = self.processor.process(raw_positions, instrument_metadata)
+        return portfolio
 
     def fetch_and_display(self) -> bool:
         portfolio = self.fetch()
@@ -515,19 +522,20 @@ return portfolio
             logger.warning("No saved portfolio available")
             return False
 
-def fetch_and_upload_to_gsheet(self) -> bool:
-sheet_name = "RawData"
-logger.info(f"Target worksheet name set to: {sheet_name}")
-portfolio = self.fetch()
-        if portfolio:
-            if not self.google_sheet.client or not self.google_sheet.sheet:
-                logger.error("Google Sheets client not initialized. Cannot upload.")
-                return False
-            return self.google_sheet.upsert_daily_data(portfolio, sheet_name)
-        else:
+    def fetch_and_upload_to_gsheet(self) -> bool:
+        sheet_name = "RawData"
+        logger.info(f"Target worksheet name set to: {sheet_name}")
+        portfolio = self.fetch()
         if not portfolio:
-logger.error("Could not fetch portfolio, skipping GSheet upload")
-return False
+            logger.error("Could not fetch portfolio, skipping GSheet upload")
+            return False
+        if not self.google_sheet.client or not self.google_sheet.sheet:
+            logger.error("Google Sheets client not initialized. Cannot upload.")
+            return False
+        # Determine mode from GitHub Actions; default to 'manual' when run locally
+        gh_event = os.getenv('GITHUB_EVENT_NAME', '')
+        mode = 'auto' if gh_event == 'schedule' else 'manual'
+        return self.google_sheet.upsert_daily_data(portfolio, sheet_name, mode)
 
 
 class DataStore:
@@ -546,13 +554,7 @@ class DataStore:
             return True
         except IOError as e:
             logger.error(f"Failed to save portfolio: {e}")
-        if not self.google_sheet.client or not self.google_sheet.sheet:
-            logger.error("Google Sheets client not initialized. Cannot upload.")
-return False
-        # Determine mode from GitHub Actions; default to 'manual' when run locally
-        gh_event = os.getenv('GITHUB_EVENT_NAME', '')
-        mode = 'auto' if gh_event == 'schedule' else 'manual'
-        return self.google_sheet.upsert_daily_data(portfolio, sheet_name, mode)
+            return False
 
     def load_latest_portfolio(self) -> Optional[Portfolio]:
         try:
@@ -623,4 +625,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-# keep the rest of the file content (DataStore, CLI) unchanged
