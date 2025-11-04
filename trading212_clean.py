@@ -1,9 +1,11 @@
 """
-Trading212 Portfolio Monitor - Clean Foundation v1.7.4 (Method + Name columns)
+Trading212 Portfolio Monitor - Clean Foundation v1.8.0 (Hourly Logging + Hour Column)
 ================================================================
-- Adds Column K: Method (manual/automatic)
-- Adds Column L: Name (instrument display name)
-- Keeps simple daily upsert behavior
+- Adds Column B: Hour (hour of the day when logged)
+- Changes from daily upsert to hourly append
+- Adds Column L: Method (manual/automatic)
+- Adds Column M: Name (instrument display name)
+- Each hour creates new entries instead of overwriting
 """
 
 import os
@@ -256,43 +258,50 @@ class GoogleSheets:
             logger.error(f"Worksheet access failed: {e}")
             return None
 
-    def upsert_daily(self, portfolio: Portfolio, title: str, method: str) -> bool:
+    def append_hourly(self, portfolio: Portfolio, title: str, method: str) -> bool:
+        """Append new hourly data without overwriting existing entries"""
         ws = self._ws(title)
         if not ws:
             return False
+        
+        # Updated header with Hour column as column B
         header = [
-            "Date", "Timestamp", "Ticker",
+            "Date", "Hour", "Timestamp", "Ticker",
             "Quantity", "Avg Price", "Current Price", "P&L",
             "Currency", "Total value in foreign currency", "Total value in HUF",
             "Method", "Name"
         ]
+        
         try:
             if ws.acell('A1').value is None:
                 ws.append_row(header, value_input_option='USER_ENTERED')
         except Exception:
             ws.append_row(header, value_input_option='USER_ENTERED')
 
-        today = portfolio.timestamp[:10]
-        try:
-            cells = ws.findall(today, in_column=1)
-        except gspread.exceptions.CellNotFound:
-            cells = []
-        if cells:
-            start = cells[0].row
-            end = cells[-1].row
-            ws.delete_rows(start, end)
-
+        # Extract date and hour from timestamp
+        dt = datetime.fromisoformat(portfolio.timestamp.replace('Z', '+00:00'))
+        today = dt.strftime('%Y-%m-%d')
+        hour = dt.hour
+        
         rows: List[List[Any]] = []
         ts = portfolio.timestamp
         for p in portfolio.positions:
             rows.append([
-                today, ts, p.ticker,
+                today, hour, ts, p.ticker,
                 p.quantity, p.average_price, p.current_price, p.pnl,
                 p.currency, p.quantity * p.current_price, p.total_value_huf,
                 method, p.display_name
             ])
+        
         ws.append_rows(rows, value_input_option='USER_ENTERED')
+        logger.info(f"Appended {len(rows)} rows for {today} hour {hour}")
         return True
+
+    # Keep the old method for backward compatibility
+    def upsert_daily(self, portfolio: Portfolio, title: str, method: str) -> bool:
+        """Legacy daily upsert method - use append_hourly instead"""
+        logger.warning("upsert_daily is deprecated, use append_hourly for new hourly logging")
+        return self.append_hourly(portfolio, title, method)
 
 
 class Application:
@@ -323,12 +332,13 @@ class Application:
             return False
         event = os.getenv('GITHUB_EVENT_NAME', '')
         method = 'manual' if event == 'workflow_dispatch' else 'automatic'
-        return self.google_sheet.upsert_daily(portfolio, "RawData", method)
+        # Use the new hourly append method instead of daily upsert
+        return self.google_sheet.append_hourly(portfolio, "RawData", method)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Trading212 Portfolio Monitor v1.7.4",
+        description="Trading212 Portfolio Monitor v1.8.0",
     )
     parser.add_argument("command", nargs="?", default="fetch", choices=["fetch", "save", "latest", "gsheet"])  
     parser.add_argument("--verbose", action="store_true")
